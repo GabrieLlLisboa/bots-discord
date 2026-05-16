@@ -27,7 +27,7 @@ async def on_ready():
 async def form(ctx: commands.Context):
     """Envia o embed de abertura de whitelist com botão."""
     embed = discord.Embed(
-        title="📋 Sistema de Whitelist",
+        title="📋 Whitelist — Roleplay Serious",
         description=(
             "Bem-vindo ao processo de **Whitelist**!\n\n"
             "Para ingressar em nosso servidor de Roleplay, você precisa responder "
