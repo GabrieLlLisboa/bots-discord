@@ -2,6 +2,7 @@ import asyncio
 import discord
 from discord.ui import View, Button, Select
 from utils.roblox import fetch_roblox_user
+from utils.ticket_store import ticket_store
 
 TIMEOUT = 300  # 5 minutos por pergunta
 
@@ -120,15 +121,40 @@ def build_roblox_embed(data: dict) -> discord.Embed:
     embed.add_field(name="🏷️ Display Name", value=data["display_name"], inline=True)
     embed.add_field(name="🆔 ID", value=str(data["id"]), inline=True)
     embed.add_field(name="📅 Conta criada em", value=data["created"], inline=True)
-    embed.add_field(
-        name="🔗 Perfil",
-        value=f"[Clique aqui]({data['profile_link']})",
-        inline=True,
-    )
+    embed.add_field(name="🔗 Perfil", value=f"[Clique aqui]({data['profile_link']})", inline=True)
     if data["avatar_url"]:
         embed.set_thumbnail(url=data["avatar_url"])
     embed.set_footer(text="Roblox API • Dados públicos")
     return embed
+
+
+def build_summary_embed(
+    member: discord.Member,
+    chosen_nick: str,
+    roblox_data: dict,
+    answers: dict,
+) -> discord.Embed:
+    summary = discord.Embed(
+        title="📋 Sistema de Whitelist — Resumo",
+        description=f"Respostas de {member.mention} (`{member.id}`)",
+        color=discord.Color.purple(),
+    )
+    summary.add_field(name="🏷️ Nickname escolhido", value=f"`{chosen_nick}`", inline=False)
+    summary.add_field(
+        name="🎮 Roblox",
+        value=(
+            f"**Username:** {roblox_data['username']}\n"
+            f"**Display Name:** {roblox_data['display_name']}\n"
+            f"**ID:** {roblox_data['id']}\n"
+            f"**Criado em:** {roblox_data['created']}"
+        ),
+        inline=False,
+    )
+    for title, answer in answers.items():
+        value = answer[:1000] + "..." if len(answer) > 1000 else answer
+        summary.add_field(name=f"❓ {title}", value=value, inline=False)
+    summary.set_footer(text="Análise pendente pela staff")
+    return summary
 
 
 # ─────────────────────────────────────────────
@@ -142,16 +168,25 @@ async def ask_question(
     total: int,
 ) -> str | None:
     embed = build_question_embed(question, question_num, total)
-    await channel.send(embed=embed)
+    question_msg = await channel.send(embed=embed)
 
     def check(m: discord.Message):
         return m.author == member and m.channel == channel
 
     try:
-        msg = await member._state._get_client().wait_for(
+        reply = await member._state._get_client().wait_for(
             "message", check=check, timeout=TIMEOUT
         )
-        return msg.content
+        content = reply.content
+
+        # Apaga o embed da pergunta e a mensagem de resposta do usuário
+        try:
+            await question_msg.delete()
+            await reply.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+        return content
     except asyncio.TimeoutError:
         return None
 
@@ -168,6 +203,7 @@ async def _timeout_close(channel: discord.TextChannel):
         )
     )
     await asyncio.sleep(10)
+    ticket_store.pop(channel.id, None)
     await channel.delete(reason="Timeout na whitelist")
 
 
@@ -197,7 +233,6 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
     attempts = 0
 
     while attempts < 3:
-        # Aguarda o usuário digitar o nickname
         try:
             msg = await client.wait_for("message", check=check_member, timeout=TIMEOUT)
             nickname = msg.content.strip()
@@ -237,16 +272,15 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
                 await asyncio.sleep(10)
                 await channel.delete(reason="Limite de tentativas Roblox")
                 return
-            continue  # pede o nickname de novo
+            continue
 
-        # Conta encontrada — mostra embed + botões de confirmar
         await loading.delete()
         confirm_view = ConfirmRobloxView(member)
         await channel.send(embed=build_roblox_embed(roblox_data), view=confirm_view)
         await confirm_view.wait()
 
         if confirm_view.confirmed is True:
-            break  # segue para a enquete de nickname
+            break
 
         elif confirm_view.confirmed is False:
             attempts += 1
@@ -267,9 +301,7 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
                     color=discord.Color.orange(),
                 )
             )
-
         else:
-            # Timeout no botão
             await _timeout_close(channel)
             return
 
@@ -310,11 +342,10 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
 
     chosen_nick = nick_view.chosen
 
-    # Renomeia o membro no servidor
     try:
         await member.edit(nick=chosen_nick)
     except discord.Forbidden:
-        pass  # Bot sem permissão (ex: dono do servidor)
+        pass
 
     confirm_nick = await channel.send(
         embed=discord.Embed(
@@ -341,9 +372,7 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
     total = len(QUESTIONS)
 
     for question in QUESTIONS:
-        response = await ask_question(
-            channel, member, question, question["number"], total
-        )
+        response = await ask_question(channel, member, question, question["number"], total)
 
         if response is None:
             await channel.send(
@@ -354,49 +383,23 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
                 )
             )
             await asyncio.sleep(10)
+            ticket_store.pop(channel.id, None)
             await channel.delete(reason="Timeout nas perguntas da whitelist")
             return
 
         answers[question["title"]] = response
 
-        confirm_msg = await channel.send(
-            embed=discord.Embed(
-                description="✅ Resposta recebida! Continuando...",
-                color=discord.Color.green(),
-            )
-        )
-        await asyncio.sleep(1.5)
-        await confirm_msg.delete()
-
     # ── Resumo para a staff ───────────────────
-    summary_embed = discord.Embed(
-        title="📋 Sistema de Whitelist — Resumo",
-        description=f"Respostas de {member.mention} (`{member.id}`)",
-        color=discord.Color.purple(),
-    )
-    summary_embed.add_field(
-        name="🏷️ Nickname escolhido",
-        value=f"`{chosen_nick}`",
-        inline=False,
-    )
-    if roblox_data:
-        summary_embed.add_field(
-            name="🎮 Roblox",
-            value=(
-                f"**Username:** {roblox_data['username']}\n"
-                f"**Display Name:** {roblox_data['display_name']}\n"
-                f"**ID:** {roblox_data['id']}\n"
-                f"**Criado em:** {roblox_data['created']}"
-            ),
-            inline=False,
-        )
-    for title, answer in answers.items():
-        value = answer[:1000] + "..." if len(answer) > 1000 else answer
-        summary_embed.add_field(name=f"❓ {title}", value=value, inline=False)
-    summary_embed.set_footer(text="Análise pendente pela staff")
+    summary_embed = build_summary_embed(member, chosen_nick, roblox_data, answers)
     await channel.send(embed=summary_embed)
 
-    # ── Mensagem final ────────────────────────
+    # Salva no store para uso no !aprovar / !reprovar
+    ticket_store[channel.id] = {
+        "member": member,
+        "summary": summary_embed,
+    }
+
+    # ── Mensagem final para o usuário ─────────
     final_embed = discord.Embed(
         title="✅ Whitelist Concluída!",
         description=(
