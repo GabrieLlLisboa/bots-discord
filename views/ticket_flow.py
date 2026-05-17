@@ -1,10 +1,12 @@
 import asyncio
 import discord
-from discord.ui import View, Button, Select
+from discord.ui import View, Button
 from utils.roblox import fetch_roblox_user
 from utils.ticket_store import ticket_store
+from utils import nick_store
 
 TIMEOUT = 300  # 5 minutos por pergunta
+TIMER_UPDATE_INTERVAL = 30  # atualiza a barra a cada 30s
 
 QUESTIONS = [
     {
@@ -46,7 +48,33 @@ QUESTIONS = [
 
 
 # ─────────────────────────────────────────────
-#  View: botão de confirmar conta Roblox
+#  Barra de progresso do timer
+# ─────────────────────────────────────────────
+def _timer_bar(seconds_left: int, total: int = TIMEOUT) -> str:
+    filled = round((seconds_left / total) * 10)
+    filled = max(0, min(10, filled))
+    bar = "🟩" * filled + "⬛" * (10 - filled)
+    mins = seconds_left // 60
+    secs = seconds_left % 60
+    return f"{bar} `{mins:02d}:{secs:02d}`"
+
+
+def build_question_embed(question: dict, current: int, total: int, seconds_left: int = TIMEOUT) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"📋 Sistema de Whitelist — Pergunta {current}/{total}",
+        description=f"**{question['title']}**\n\n{question['prompt']}",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="⏱️ Tempo restante",
+        value=_timer_bar(seconds_left),
+        inline=False,
+    )
+    return embed
+
+
+# ─────────────────────────────────────────────
+#  View: confirmar conta Roblox
 # ─────────────────────────────────────────────
 class ConfirmRobloxView(View):
     def __init__(self, member: discord.Member):
@@ -74,46 +102,11 @@ class ConfirmRobloxView(View):
 
 
 # ─────────────────────────────────────────────
-#  View: enquete de nickname via Select
+#  Embeds reutilizáveis
 # ─────────────────────────────────────────────
-class NicknameSelectView(View):
-    def __init__(self, member: discord.Member, options: list[discord.SelectOption]):
-        super().__init__(timeout=TIMEOUT)
-        self.member = member
-        self.chosen: str | None = None
-        select = Select(
-            placeholder="Escolha como quer aparecer no servidor...",
-            options=options,
-        )
-        select.callback = self._callback
-        self.add_item(select)
-
-    async def _callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.member.id:
-            await interaction.response.send_message("❌ Isso não é para você.", ephemeral=True)
-            return
-        self.chosen = interaction.data["values"][0]
-        self.stop()
-        await interaction.response.defer()
-
-
-# ─────────────────────────────────────────────
-#  Helpers de embed
-# ─────────────────────────────────────────────
-def build_question_embed(question: dict, current: int, total: int) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"📋 Sistema de Whitelist — Pergunta {current}/{total}",
-        description=f"**{question['title']}**\n\n{question['prompt']}",
-        color=discord.Color.gold(),
-    )
-    embed.set_footer(text=f"⏱️ Você tem {TIMEOUT // 60} minutos para responder.")
-    return embed
-
-
 def build_roblox_embed(data: dict) -> discord.Embed:
     embed = discord.Embed(
-        title="🎮 Conta Roblox Encontrada!",
-        description="Verifique se as informações abaixo são **suas**.",
+        title="🎮 Conta Roblox",
         color=discord.Color.green(),
         url=data["profile_link"],
     )
@@ -124,7 +117,6 @@ def build_roblox_embed(data: dict) -> discord.Embed:
     embed.add_field(name="🔗 Perfil", value=f"[Clique aqui]({data['profile_link']})", inline=True)
     if data["avatar_url"]:
         embed.set_thumbnail(url=data["avatar_url"])
-    embed.set_footer(text="Roblox API • Dados públicos")
     return embed
 
 
@@ -135,30 +127,20 @@ def build_summary_embed(
     answers: dict,
 ) -> discord.Embed:
     summary = discord.Embed(
-        title="📋 Sistema de Whitelist — Resumo",
-        description=f"Respostas de {member.mention} (`{member.id}`)",
+        title="📋 Resumo da Whitelist",
+        description=f"{member.mention} • `{member.id}`",
         color=discord.Color.purple(),
     )
     summary.add_field(name="🏷️ Nickname escolhido", value=f"`{chosen_nick}`", inline=False)
-    summary.add_field(
-        name="🎮 Roblox",
-        value=(
-            f"**Username:** {roblox_data['username']}\n"
-            f"**Display Name:** {roblox_data['display_name']}\n"
-            f"**ID:** {roblox_data['id']}\n"
-            f"**Criado em:** {roblox_data['created']}"
-        ),
-        inline=False,
-    )
     for title, answer in answers.items():
         value = answer[:1000] + "..." if len(answer) > 1000 else answer
         summary.add_field(name=f"❓ {title}", value=value, inline=False)
-    summary.set_footer(text="Análise pendente pela staff")
+    summary.set_footer(text="Use !aprovar ou !reprovar <motivo>")
     return summary
 
 
 # ─────────────────────────────────────────────
-#  Pergunta simples (aguarda msg do usuário)
+#  Pergunta com timer ao vivo
 # ─────────────────────────────────────────────
 async def ask_question(
     channel: discord.TextChannel,
@@ -167,32 +149,61 @@ async def ask_question(
     question_num: int,
     total: int,
 ) -> str | None:
-    embed = build_question_embed(question, question_num, total)
-    question_msg = await channel.send(embed=embed)
+    client = member._state._get_client()
+    seconds_left = TIMEOUT
+    question_msg = await channel.send(embed=build_question_embed(question, question_num, total, seconds_left))
+
+    answer_future: asyncio.Future = asyncio.get_event_loop().create_future()
 
     def check(m: discord.Message):
         return m.author == member and m.channel == channel
 
-    try:
-        reply = await member._state._get_client().wait_for(
-            "message", check=check, timeout=TIMEOUT
-        )
-        content = reply.content
-
-        # Apaga o embed da pergunta e a mensagem de resposta do usuário
+    async def wait_for_reply():
         try:
-            await question_msg.delete()
-            await reply.delete()
-        except (discord.NotFound, discord.Forbidden):
-            pass
+            reply = await client.wait_for("message", check=check, timeout=TIMEOUT)
+            if not answer_future.done():
+                answer_future.set_result(reply)
+        except asyncio.TimeoutError:
+            if not answer_future.done():
+                answer_future.set_result(None)
 
-        return content
-    except asyncio.TimeoutError:
+    async def update_timer():
+        nonlocal seconds_left
+        while not answer_future.done():
+            await asyncio.sleep(TIMER_UPDATE_INTERVAL)
+            if answer_future.done():
+                break
+            seconds_left = max(0, seconds_left - TIMER_UPDATE_INTERVAL)
+            try:
+                await question_msg.edit(
+                    embed=build_question_embed(question, question_num, total, seconds_left)
+                )
+            except (discord.NotFound, discord.HTTPException):
+                break
+
+    # Roda os dois em paralelo
+    await asyncio.gather(
+        wait_for_reply(),
+        update_timer(),
+        return_exceptions=True,
+    )
+
+    reply = answer_future.result()
+
+    if reply is None:
         return None
+
+    content = reply.content
+    try:
+        await question_msg.delete()
+        await reply.delete()
+    except (discord.NotFound, discord.Forbidden):
+        pass
+    return content
 
 
 # ─────────────────────────────────────────────
-#  Helper: fechar por timeout
+#  Timeout
 # ─────────────────────────────────────────────
 async def _timeout_close(channel: discord.TextChannel):
     await channel.send(
@@ -212,18 +223,20 @@ async def _timeout_close(channel: discord.TextChannel):
 # ─────────────────────────────────────────────
 async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Member):
     client = member._state._get_client()
+    temp_msgs: list[discord.Message] = []
 
-    # ── Boas-vindas ──────────────────────────
-    welcome_embed = discord.Embed(
-        title="📋 Sistema de Whitelist",
-        description=(
-            f"Olá, {member.mention}!\n\n"
-            "Seja bem-vindo jogador! Para começar sua whitelist, envie seu **nickname do Roblox**."
-        ),
-        color=discord.Color.blurple(),
+    # ── Boas-vindas ───────────────────────────
+    welcome = await channel.send(
+        embed=discord.Embed(
+            title="📋 Sistema de Whitelist",
+            description=(
+                f"Olá, {member.mention}!\n\n"
+                "Seja bem-vindo jogador! Para começar sua whitelist, envie seu **nickname do Roblox**."
+            ),
+            color=discord.Color.blurple(),
+        )
     )
-    welcome_embed.set_footer(text="Digite apenas o nickname e aguarde.")
-    await channel.send(embed=welcome_embed)
+    temp_msgs.append(welcome)
 
     def check_member(m: discord.Message):
         return m.author == member and m.channel == channel
@@ -235,19 +248,21 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
     while attempts < 3:
         try:
             msg = await client.wait_for("message", check=check_member, timeout=TIMEOUT)
-            nickname = msg.content.strip()
         except asyncio.TimeoutError:
             await _timeout_close(channel)
             return
 
+        temp_msgs.append(msg)
+
         loading = await channel.send(
             embed=discord.Embed(
-                description=f"🔍 Buscando conta Roblox: **{nickname}**...",
+                description=f"🔍 Buscando conta Roblox: **{msg.content.strip()}**...",
                 color=discord.Color.light_grey(),
             )
         )
+        temp_msgs.append(loading)
 
-        roblox_data = await fetch_roblox_user(nickname)
+        roblox_data = await fetch_roblox_user(msg.content.strip())
 
         if not roblox_data:
             attempts += 1
@@ -255,8 +270,8 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
                 embed=discord.Embed(
                     title="❌ Conta não encontrada",
                     description=(
-                        f"Nenhuma conta Roblox encontrada com o nickname **{nickname}**.\n"
-                        f"Verifique o nome e tente novamente. ({attempts}/3)"
+                        f"Nenhuma conta encontrada com **{msg.content.strip()}**.\n"
+                        f"Tente novamente. ({attempts}/3)"
                     ),
                     color=discord.Color.red(),
                 )
@@ -265,7 +280,7 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
                 await channel.send(
                     embed=discord.Embed(
                         title="🚫 Limite de tentativas atingido",
-                        description="O ticket será fechado. Entre em contato com a staff.",
+                        description="O ticket será fechado em 10 segundos.",
                         color=discord.Color.dark_red(),
                     )
                 )
@@ -275,8 +290,11 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
             continue
 
         await loading.delete()
+        temp_msgs.remove(loading)
+
         confirm_view = ConfirmRobloxView(member)
-        await channel.send(embed=build_roblox_embed(roblox_data), view=confirm_view)
+        roblox_confirm_msg = await channel.send(embed=build_roblox_embed(roblox_data), view=confirm_view)
+        temp_msgs.append(roblox_confirm_msg)
         await confirm_view.wait()
 
         if confirm_view.confirmed is True:
@@ -295,79 +313,36 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
                 await asyncio.sleep(10)
                 await channel.delete(reason="Limite de tentativas Roblox")
                 return
-            await channel.send(
+            retry = await channel.send(
                 embed=discord.Embed(
                     description=f"Tudo bem! Envie o nickname correto. ({attempts}/3)",
                     color=discord.Color.orange(),
                 )
             )
+            temp_msgs.append(retry)
         else:
             await _timeout_close(channel)
             return
 
-    # ── Enquete de nickname ───────────────────
-    roblox_name = roblox_data["username"]
-    display_name = roblox_data["display_name"]
-    discord_name = member.name
+    # ── Define nickname automático ───────────
+    # Formato: "DisplayName (username)" ou só "username" se não tiver display name diferente
+    roblox_username = roblox_data["username"]
+    roblox_display = roblox_data["display_name"]
 
-    opt1 = roblox_name
-    opt2 = f"{roblox_name} ({discord_name})"
-    opt3 = f"{display_name} ({roblox_name})"
-
-    options = [
-        discord.SelectOption(label=opt1, value=opt1, emoji="1️⃣"),
-        discord.SelectOption(label=opt2, value=opt2, emoji="2️⃣"),
-        discord.SelectOption(label=opt3, value=opt3, emoji="3️⃣"),
-    ]
-
-    poll_embed = discord.Embed(
-        title="🏷️ Como você quer aparecer no servidor?",
-        description=(
-            f"**1️⃣** `{opt1}`\n"
-            f"**2️⃣** `{opt2}`\n"
-            f"**3️⃣** `{opt3}`\n\n"
-            "Selecione uma opção no menu abaixo."
-        ),
-        color=discord.Color.blurple(),
-    )
-    poll_embed.set_footer(text=f"⏱️ Você tem {TIMEOUT // 60} minutos para escolher.")
-
-    nick_view = NicknameSelectView(member, options)
-    await channel.send(embed=poll_embed, view=nick_view)
-    await nick_view.wait()
-
-    if nick_view.chosen is None:
-        await _timeout_close(channel)
-        return
-
-    chosen_nick = nick_view.chosen
+    if roblox_display and roblox_display.lower() != roblox_username.lower():
+        chosen_nick = f"{roblox_display} ({roblox_username})"
+    else:
+        chosen_nick = roblox_username
 
     try:
         await member.edit(nick=chosen_nick)
     except discord.Forbidden:
         pass
 
-    confirm_nick = await channel.send(
-        embed=discord.Embed(
-            description=f"✅ Nickname definido para **{chosen_nick}**! Continuando...",
-            color=discord.Color.green(),
-        )
-    )
-    await asyncio.sleep(2)
-    await confirm_nick.delete()
+    # Registra o nick correto para monitoramento (persiste em JSON)
+    nick_store.set(member.id, chosen_nick)
 
-    # ── Início das perguntas ──────────────────
-    start_embed = discord.Embed(
-        title="📋 Sistema de Whitelist — Perguntas",
-        description=(
-            "Ótimo! Agora responda as perguntas abaixo **uma de cada vez**.\n"
-            f"Você tem **{TIMEOUT // 60} minutos** para responder cada uma."
-        ),
-        color=discord.Color.blurple(),
-    )
-    await channel.send(embed=start_embed)
-    await asyncio.sleep(1)
-
+    # ── Perguntas com timer ───────────────────
     answers = {}
     total = len(QUESTIONS)
 
@@ -389,28 +364,50 @@ async def run_whitelist_flow(channel: discord.TextChannel, member: discord.Membe
 
         answers[question["title"]] = response
 
-    # ── Resumo para a staff ───────────────────
+    # ── Limpa TODO o canal ────────────────────
+    try:
+        await channel.purge(limit=500)
+    except (discord.Forbidden, discord.HTTPException):
+        # Fallback: apaga mensagem por mensagem
+        for m in temp_msgs:
+            try:
+                await m.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+
+    # ── Canal final: conta Roblox + resumo ────
+    await channel.send(embed=build_roblox_embed(roblox_data))
+
     summary_embed = build_summary_embed(member, chosen_nick, roblox_data, answers)
     await channel.send(embed=summary_embed)
 
-    # Salva no store para uso no !aprovar / !reprovar
+    # Salva para !aprovar / !reprovar
     ticket_store[channel.id] = {
         "member": member,
         "summary": summary_embed,
+        "roblox_data": roblox_data,
     }
 
-    # ── Mensagem final para o usuário ─────────
+    # ── Notifica o usuário no PV ──────────────
     final_embed = discord.Embed(
-        title="✅ Whitelist Concluída!",
+        title="✅ Whitelist Enviada!",
         description=(
-            f"{member.mention}, sua whitelist foi enviada com sucesso!\n\n"
-            "**✅ Sua whitelist foi concluída! Aguarde a equipe analisar suas respostas.**\n\n"
-            "Nossa equipe irá avaliar suas respostas em breve. "
-            "Fique de olho nas notificações do servidor!"
+            "Sua whitelist foi enviada com sucesso!\n\n"
+            "**Aguarde a equipe analisar suas respostas.**\n\n"
+            "Você será notificado por aqui quando a análise for concluída."
         ),
         color=discord.Color.green(),
     )
     final_embed.set_footer(text="Sistema de Whitelist • Obrigado pela participação!")
-    if roblox_data and roblox_data["avatar_url"]:
+    if roblox_data["avatar_url"]:
         final_embed.set_thumbnail(url=roblox_data["avatar_url"])
-    await channel.send(embed=final_embed)
+
+    try:
+        await member.send(embed=final_embed)
+    except discord.Forbidden:
+        fallback = await channel.send(content=member.mention, embed=final_embed)
+        await asyncio.sleep(15)
+        try:
+            await fallback.delete()
+        except discord.NotFound:
+            pass

@@ -1,6 +1,8 @@
 import discord
 from discord.ui import View, Button, Modal, TextInput
 import re
+import aiohttp
+import io
 
 
 class BuscarIdModal(Modal, title="🔍 Buscar Identidade"):
@@ -21,7 +23,6 @@ class BuscarIdModal(Modal, title="🔍 Buscar Identidade"):
 
         numero_raw = self.numero.value.strip()
 
-        # Normaliza para formato com zero à esquerda (ex: "2" → "02")
         try:
             numero_int = int(numero_raw)
             numero_fmt = f"{numero_int:02d}"
@@ -32,20 +33,19 @@ class BuscarIdModal(Modal, title="🔍 Buscar Identidade"):
             )
             return
 
-        # Padrão flexível: aceita "RG 01", "Identidade 01", "ID 01", "#01", etc.
-        # Qualquer palavra/prefixo seguido do número (com ou sem zero à esquerda)
+        # Padrão flexível: RG 01, Identidade 01, ID 01, #01, etc.
         pattern = re.compile(
             rf"(?:rg|identidade|id|#)\s*0*{numero_int}\b",
             re.IGNORECASE,
         )
 
-        alvo_msg = None
+        alvo_msg: discord.Message | None = None
         async for msg in self.canal.history(limit=500):
-            # Verifica no conteúdo de texto da mensagem
+            # Verifica texto da mensagem
             if pattern.search(msg.content):
                 alvo_msg = msg
                 break
-            # Verifica também nos embeds
+            # Verifica embeds
             for embed in msg.embeds:
                 texto = " ".join(filter(None, [
                     embed.title,
@@ -65,34 +65,50 @@ class BuscarIdModal(Modal, title="🔍 Buscar Identidade"):
             )
             return
 
-        # Envia a mensagem encontrada no DM do usuário
+        # ── Envia no PV ──────────────────────
         try:
             dm = await interaction.user.create_dm()
 
-            header = discord.Embed(
-                title=f"🪪 Identidade {numero_fmt} encontrada!",
-                description=f"Aqui está o registro da **Identidade {numero_fmt}**:",
-                color=discord.Color.dark_gold(),
-            )
-            await dm.send(embed=header)
+            # Cabeçalho simples (sem embed)
+            await dm.send(f"**🪪 Identidade {numero_fmt}**")
 
-            # Encaminha embeds da mensagem original, se houver
-            if alvo_msg.embeds:
-                for emb in alvo_msg.embeds:
-                    await dm.send(embed=emb)
-            # Encaminha conteúdo de texto, se houver
+            # Conteúdo de texto da mensagem original
             if alvo_msg.content:
-                content_embed = discord.Embed(
-                    description=alvo_msg.content,
-                    color=discord.Color.gold(),
-                )
-                content_embed.set_footer(
-                    text=f"Enviado por {alvo_msg.author.display_name}",
-                )
-                await dm.send(embed=content_embed)
+                await dm.send(alvo_msg.content)
+
+            # Conteúdo de embeds (como texto)
+            for emb in alvo_msg.embeds:
+                partes = []
+                if emb.title:
+                    partes.append(f"**{emb.title}**")
+                if emb.description:
+                    partes.append(emb.description)
+                for field in emb.fields:
+                    partes.append(f"**{field.name}**\n{field.value}")
+                if partes:
+                    await dm.send("\n".join(partes))
+
+            # Foto(s) anexada(s) à mensagem original — baixa e reencaminha
+            fotos_enviadas = 0
+            for attachment in alvo_msg.attachments:
+                if attachment.content_type and attachment.content_type.startswith("image/"):
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(attachment.url) as resp:
+                                if resp.status == 200:
+                                    data = await resp.read()
+                                    file = discord.File(
+                                        io.BytesIO(data),
+                                        filename=attachment.filename,
+                                    )
+                                    await dm.send(file=file)
+                                    fotos_enviadas += 1
+                    except Exception:
+                        pass  # Se falhar no download, ignora silenciosamente
 
             await interaction.followup.send(
-                f"✅ A **Identidade {numero_fmt}** foi enviada para o seu privado!",
+                f"✅ A **Identidade {numero_fmt}** foi enviada para o seu privado!"
+                + (f" ({fotos_enviadas} foto(s) incluída(s))" if fotos_enviadas else ""),
                 ephemeral=True,
             )
 
@@ -103,14 +119,15 @@ class BuscarIdModal(Modal, title="🔍 Buscar Identidade"):
             )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        await interaction.followup.send(
-            "❌ Ocorreu um erro ao buscar a identidade.", ephemeral=True
-        )
+        try:
+            await interaction.followup.send(
+                "❌ Ocorreu um erro ao buscar a identidade.", ephemeral=True
+            )
+        except Exception:
+            pass
 
 
 class IdView(View):
-    """View persistente com o botão de busca de ID."""
-
     def __init__(self, canal: discord.TextChannel):
         super().__init__(timeout=None)
         self.canal = canal

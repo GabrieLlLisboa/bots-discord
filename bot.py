@@ -7,6 +7,7 @@ import asyncio
 from views.whitelist_button import WhitelistView
 from views.id_view import IdView
 from utils.ticket_store import ticket_store
+from utils import nick_store
 
 load_dotenv()
 TOKEN = os.getenv("WHITELIST_TOKEN")
@@ -18,10 +19,7 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─────────────────────────────────────────────
-#  Rastreia a mensagem do !id por canal
-#  { channel_id: message_id }
-# ─────────────────────────────────────────────
+# { channel_id: message_id } — rastreia mensagem do !id
 id_messages: dict[int, int] = {}
 
 
@@ -29,6 +27,30 @@ id_messages: dict[int, int] = {}
 async def on_ready():
     print(f"✅ Bot online como {bot.user} (ID: {bot.user.id})")
     print("----------------------------------------------")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Monitora mudanças de nick e corrige se a pessoa tentou trocar."""
+    # Só age se o nick mudou E foi o próprio membro quem alterou (não o bot)
+    if before.nick == after.nick:
+        return
+
+    member_id = after.id
+    correct_nick = nick_store.get(member_id)
+
+    if not correct_nick:
+        return  # Membro não tem nick registrado pelo bot
+
+    # Se o novo nick é diferente do registrado, corrige
+    if after.nick != correct_nick:
+        try:
+            await after.edit(
+                nick=correct_nick,
+                reason="Correção automática de nickname — alteração não autorizada",
+            )
+        except discord.Forbidden:
+            pass  # Bot sem permissão (ex: dono do servidor)
 
 
 @bot.event
@@ -45,16 +67,14 @@ async def on_message(message: discord.Message):
 
     msg_id = id_messages[channel_id]
 
-    # Verifica se a última mensagem do canal NÃO é a do bot
     try:
         last = [m async for m in message.channel.history(limit=1)][0]
     except Exception:
         return
 
     if last.id == msg_id:
-        return  # já é a última, tudo certo
+        return
 
-    # Apaga a antiga e reenvia
     try:
         old_msg = await message.channel.fetch_message(msg_id)
         await old_msg.delete()
@@ -74,7 +94,6 @@ async def on_message(message: discord.Message):
 @bot.command(name="form")
 @commands.has_permissions(administrator=True)
 async def form(ctx: commands.Context):
-    """Envia o embed de abertura de whitelist com botão."""
     await ctx.message.delete()
     embed = discord.Embed(
         title="📋 Whitelist",
@@ -91,13 +110,11 @@ async def form(ctx: commands.Context):
     embed.set_footer(text="Sistema de Whitelist • Powered by Discord Bot")
     if ctx.guild.icon:
         embed.set_thumbnail(url=ctx.guild.icon.url)
-
-    view = WhitelistView()
-    await ctx.send(embed=embed, view=view)
+    await ctx.send(embed=embed, view=WhitelistView())
 
 
 @form.error
-async def form_error(ctx: commands.Context, error):
+async def form_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Sem permissão.", delete_after=5)
 
@@ -122,10 +139,8 @@ def _build_id_embed() -> discord.Embed:
 @bot.command(name="id")
 @commands.has_permissions(administrator=True)
 async def id_cmd(ctx: commands.Context):
-    """Envia a caixinha de busca de IDs e a mantém sempre como última mensagem."""
     await ctx.message.delete()
 
-    # Remove mensagem anterior deste canal, se houver
     channel_id = ctx.channel.id
     if channel_id in id_messages:
         try:
@@ -134,15 +149,14 @@ async def id_cmd(ctx: commands.Context):
         except (discord.NotFound, discord.Forbidden):
             pass
 
-    embed = _build_id_embed()
     view = IdView(ctx.channel)
-    msg = await ctx.send(embed=embed, view=view)
+    msg = await ctx.send(embed=_build_id_embed(), view=view)
     id_messages[channel_id] = msg.id
     view.message_id = msg.id
 
 
 @id_cmd.error
-async def id_error(ctx: commands.Context, error):
+async def id_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Sem permissão.", delete_after=5)
 
@@ -153,19 +167,20 @@ async def id_error(ctx: commands.Context, error):
 @bot.command(name="aprovar")
 @commands.has_permissions(manage_channels=True)
 async def aprovar(ctx: commands.Context):
-    """Aprova a whitelist do ticket atual e notifica o usuário no privado."""
     channel = ctx.channel
     ticket_data = ticket_store.get(channel.id)
 
     if not ticket_data:
-        await ctx.send("❌ Este canal não é um ticket de whitelist.", delete_after=5)
+        await ctx.send(
+            "❌ Ticket não encontrado no sistema. A whitelist pode não ter sido concluída ainda.",
+            delete_after=8,
+        )
         return
 
     member: discord.Member = ticket_data["member"]
     summary: discord.Embed = ticket_data["summary"]
     await ctx.message.delete()
 
-    # DM para o usuário
     dm_embed = discord.Embed(
         title="✅ Whitelist Aprovada!",
         description=(
@@ -180,13 +195,14 @@ async def aprovar(ctx: commands.Context):
         await member.send(embed=dm_embed)
         await member.send(embed=summary)
     except discord.Forbidden:
-        await channel.send("⚠️ Não consegui enviar DM ao usuário (DMs fechadas).", delete_after=5)
+        await channel.send(
+            "⚠️ Não consegui enviar DM ao usuário (DMs fechadas).", delete_after=6
+        )
 
-    # Confirmação no canal antes de deletar
-    confirm = await channel.send(
+    await channel.send(
         embed=discord.Embed(
             title="✅ Whitelist aprovada!",
-            description=f"{member.mention} foi notificado. O ticket será fechado em 5 segundos.",
+            description=f"{member.mention} foi notificado no privado. Fechando em 5s...",
             color=discord.Color.green(),
         )
     )
@@ -196,7 +212,7 @@ async def aprovar(ctx: commands.Context):
 
 
 @aprovar.error
-async def aprovar_error(ctx: commands.Context, error):
+async def aprovar_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Sem permissão.", delete_after=5)
 
@@ -206,20 +222,30 @@ async def aprovar_error(ctx: commands.Context, error):
 # ─────────────────────────────────────────────
 @bot.command(name="reprovar")
 @commands.has_permissions(manage_channels=True)
-async def reprovar(ctx: commands.Context, *, motivo: str = "Sem motivo informado."):
-    """Reprova a whitelist do ticket atual e notifica o usuário no privado."""
+async def reprovar(ctx: commands.Context, *, motivo: str = None):
     channel = ctx.channel
+
+    # Motivo obrigatório
+    if not motivo:
+        await ctx.send(
+            "❌ Informe o motivo: `!reprovar <motivo>`\nExemplo: `!reprovar Respostas muito curtas`",
+            delete_after=8,
+        )
+        return
+
     ticket_data = ticket_store.get(channel.id)
 
     if not ticket_data:
-        await ctx.send("❌ Este canal não é um ticket de whitelist.", delete_after=5)
+        await ctx.send(
+            "❌ Ticket não encontrado no sistema. A whitelist pode não ter sido concluída ainda.",
+            delete_after=8,
+        )
         return
 
     member: discord.Member = ticket_data["member"]
     summary: discord.Embed = ticket_data["summary"]
     await ctx.message.delete()
 
-    # DM para o usuário
     dm_embed = discord.Embed(
         title="❌ Whitelist Recusada",
         description=(
@@ -235,12 +261,14 @@ async def reprovar(ctx: commands.Context, *, motivo: str = "Sem motivo informado
         await member.send(embed=dm_embed)
         await member.send(embed=summary)
     except discord.Forbidden:
-        await channel.send("⚠️ Não consegui enviar DM ao usuário (DMs fechadas).", delete_after=5)
+        await channel.send(
+            "⚠️ Não consegui enviar DM ao usuário (DMs fechadas).", delete_after=6
+        )
 
-    confirm = await channel.send(
+    await channel.send(
         embed=discord.Embed(
             title="❌ Whitelist recusada",
-            description=f"{member.mention} foi notificado. O ticket será fechado em 5 segundos.",
+            description=f"{member.mention} foi notificado no privado. Fechando em 5s...",
             color=discord.Color.red(),
         )
     )
@@ -250,11 +278,9 @@ async def reprovar(ctx: commands.Context, *, motivo: str = "Sem motivo informado
 
 
 @reprovar.error
-async def reprovar_error(ctx: commands.Context, error):
+async def reprovar_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Sem permissão.", delete_after=5)
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Informe o motivo: `!reprovar <motivo>`", delete_after=5)
 
 
 bot.run(TOKEN)
